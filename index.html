@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Процессы сервера</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    h1 { margin: 0 0 12px; font-size: 20px; }
+    .meta { margin-bottom: 12px; color: #666; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #ddd; text-align: left; }
+    th { cursor: pointer; user-select: none; position: sticky; top: 0; background: inherit; }
+    th .sort-indicator { margin-left: 6px; font-size: 12px; opacity: 0.7; }
+    tbody tr:hover { background: rgba(0,0,0,0.04); }
+    .cpu { text-align: right; font-variant-numeric: tabular-nums; }
+    .pid { width: 120px; }
+    .owner { width: 180px; }
+    .cmd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .status { margin-top: 10px; font-size: 13px; color: #888; }
+    .error { color: #c00; }
+  </style>
+</head>
+<body>
+  <h1>Список процессов сервера</h1>
+  <div class="meta">
+    Обновление каждые 3 секунды. Нажмите на заголовок столбца для сортировки.
+  </div>
+
+  <table id="proc-table" aria-live="polite">
+    <thead>
+      <tr>
+        <th data-key="cpu" data-type="number">CPU usage <span class="sort-indicator"></span></th>
+        <th class="pid" data-key="pid" data-type="number">ID <span class="sort-indicator"></span></th>
+        <th class="owner" data-key="user" data-type="string">Owner <span class="sort-indicator"></span></th>
+        <th class="cmd" data-key="cmd" data-type="string">Command <span class="sort-indicator"></span></th>
+      </tr>
+    </thead>
+    <tbody id="proc-body">
+      <!-- rows go here -->
+    </tbody>
+  </table>
+
+  <div id="status" class="status">Загрузка данных…</div>
+
+  <script>
+    // --- Config ---
+    const ENDPOINT = 'server.php';
+    const REFRESH_MS = 3000;
+
+    // --- State ---
+    let processes = [];
+    let sortState = { key: 'cpu', dir: 'desc', type: 'number' }; // default sort by CPU desc
+    let timer = null;
+
+    // --- Utilities ---
+    function parseNumberSafely(v) {
+      if (typeof v === 'number') return v;
+      if (v == null) return NaN;
+      const n = Number(String(v).replace(',', '.').trim());
+      return isNaN(n) ? NaN : n;
+    }
+
+    function compareBy(a, b, key, type, dir) {
+      let va = a[key], vb = b[key];
+      if (type === 'number') {
+        va = parseNumberSafely(va);
+        vb = parseNumberSafely(vb);
+      } else {
+        va = (va ?? '').toString().toLowerCase();
+        vb = (vb ?? '').toString().toLowerCase();
+      }
+
+      // Stable sort: tie-breaker by PID
+      let res = 0;
+      if (va < vb) res = -1;
+      else if (va > vb) res = 1;
+      else res = parseNumberSafely(a.pid) - parseNumberSafely(b.pid);
+
+      return dir === 'asc' ? res : -res;
+    }
+
+    function setStatus(msg, isError = false) {
+      const el = document.getElementById('status');
+      el.textContent = msg;
+      el.className = 'status' + (isError ? ' error' : '');
+    }
+
+    // --- Rendering ---
+    function renderTable(rows) {
+      const tbody = document.getElementById('proc-body');
+      const frag = document.createDocumentFragment();
+
+      rows.forEach(row => {
+        const tr = document.createElement('tr');
+
+        // CPU
+        const tdCpu = document.createElement('td');
+        tdCpu.className = 'cpu';
+        const cpuVal = parseNumberSafely(row.cpu);
+        tdCpu.textContent = isNaN(cpuVal) ? (row.cpu ?? '') : cpuVal.toFixed(2);
+        tr.appendChild(tdCpu);
+
+        // PID
+        const tdPid = document.createElement('td');
+        tdPid.className = 'pid';
+        tdPid.textContent = row.pid ?? '';
+        tr.appendChild(tdPid);
+
+        // Owner
+        const tdUser = document.createElement('td');
+        tdUser.className = 'owner';
+        tdUser.textContent = row.user ?? '';
+        tr.appendChild(tdUser);
+
+        // Command
+        const tdCmd = document.createElement('td');
+        tdCmd.className = 'cmd';
+        tdCmd.textContent = row.cmd ?? '';
+        tr.appendChild(tdCmd);
+
+        frag.appendChild(tr);
+      });
+
+      // Replace tbody content efficiently
+      tbody.innerHTML = '';
+      tbody.appendChild(frag);
+
+      // Update sort indicators
+      updateSortIndicators();
+    }
+
+    function updateSortIndicators() {
+      document.querySelectorAll('th .sort-indicator').forEach(el => el.textContent = '');
+      const th = document.querySelector(`th[data-key="${sortState.key}"] .sort-indicator`);
+      if (th) th.textContent = sortState.dir === 'asc' ? '▲' : '▼';
+    }
+
+    // --- Sorting ---
+    function sortRows() {
+      const { key, type, dir } = sortState;
+      processes.sort((a, b) => compareBy(a, b, key, type, dir));
+    }
+
+    function onHeaderClick(e) {
+      const th = e.currentTarget;
+      const key = th.getAttribute('data-key');
+      const type = th.getAttribute('data-type') || 'string';
+
+      if (sortState.key === key) {
+        sortState.dir = sortState.dir === 'asc' ? 'desc' : 'asc';
+      } else {
+        sortState.key = key;
+        sortState.type = type;
+        sortState.dir = 'asc';
+      }
+
+      sortRows();
+      renderTable(processes);
+    }
+
+    // --- Fetching ---
+    async function fetchProcesses() {
+      try {
+        const res = await fetch(ENDPOINT, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        // Expecting { time, processes: [{cpu,pid,user,cmd}] }
+        const rows = Array.isArray(data.processes) ? data.processes : [];
+        processes = rows.map(r => ({
+          cpu: r.cpu ?? r.CPU ?? '',     // be robust if fields differ
+          pid: r.pid ?? r.Id ?? '',
+          user: r.user ?? r.Owner ?? '',
+          cmd: r.cmd ?? r.ProcessName ?? r.CommandLine ?? ''
+        }));
+
+        sortRows();
+        renderTable(processes);
+
+        const ts = (data.time ? new Date(data.time * 1000) : new Date());
+        setStatus(`Последнее обновление: ${ts.toLocaleString()}`);
+      } catch (err) {
+        setStatus(`Ошибка загрузки: ${err.message}`, true);
+      }
+    }
+
+    function startAutoRefresh() {
+      if (timer) clearInterval(timer);
+      timer = setInterval(fetchProcesses, REFRESH_MS);
+    }
+
+    // --- Init ---
+    document.addEventListener('DOMContentLoaded', () => {
+      // Bind header click handlers
+      document.querySelectorAll('thead th').forEach(th => {
+        th.addEventListener('click', onHeaderClick);
+      });
+
+      // Initial load and start polling
+      fetchProcesses();
+      startAutoRefresh();
+    });
+  </script>
+</body>
+</html>
